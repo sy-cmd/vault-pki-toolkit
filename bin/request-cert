@@ -1,0 +1,546 @@
+#!/bin/bash
+#
+# request-cert
+# Request TLS certificates from HashiCorp Vault PKI
+#
+# Author: Sydney Fwalanga
+# Repository: https://github.com/sy-cmd/vault-pki-toolkit
+
+set -euo pipefail
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+# Vault connection
+VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
+VAULT_TOKEN="${VAULT_TOKEN:-}"
+
+# Default PKI path
+PKI_PATH="${PKI_PATH:-pki_int}"
+
+# Default values
+ROLE="${ROLE:-server}"
+TTL="${TTL:-720h}"
+OUTPUT_DIR="${OUTPUT_DIR:-.}"
+FORMAT="${FORMAT:-bundle}"
+
+# Certificate details
+COMMON_NAME=""
+ALT_NAMES=""
+IP_SANS=""
+URI_SANS=""
+EXCLUDE_CN_FROM_SANS="false"
+
+# Options
+FORCE="false"
+VERBOSE="false"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+log_info() {
+    echo -e "${BLUE}ℹ${NC}  $1"
+}
+
+log_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}⚠${NC}  $1"
+}
+
+log_error() {
+    echo -e "${RED}✗${NC} $1" >&2
+}
+
+log_verbose() {
+    if [ "$VERBOSE" = "true" ]; then
+        echo -e "${BLUE}→${NC} $1"
+    fi
+}
+
+show_usage() {
+    cat << EOF
+Usage: request-cert [OPTIONS]
+
+Request a TLS certificate from HashiCorp Vault PKI.
+
+REQUIRED:
+    -n, --common-name NAME    Common name for the certificate (required)
+
+OPTIONAL:
+    -r, --role ROLE           Vault PKI role to use (default: $ROLE)
+    -t, --ttl DURATION        Certificate TTL (default: $TTL)
+    -a, --alt-names NAMES     Subject Alternative Names (comma-separated)
+    -i, --ip-sans IPS         IP SANs (comma-separated)
+    -u, --uri-sans URIS       URI SANs (comma-separated)
+    -o, --output DIR          Output directory (default: current directory)
+    -p, --pki-path PATH       Vault PKI path (default: $PKI_PATH)
+    -f, --format FORMAT       Output format: bundle, separate, pem (default: bundle)
+    --exclude-cn-from-sans    Exclude CN from SANs
+    --force                   Overwrite existing files
+    -v, --verbose             Verbose output
+    -h, --help                Show this help message
+
+OUTPUT FORMATS:
+    bundle    : All certificates in one file (cert + CA chain)
+    separate  : Separate files for cert, key, and CA chain (default)
+    pem       : PEM bundle with cert, key, and CA chain in one file
+
+EXAMPLES:
+    # Basic server certificate
+    request-cert -n web.example.com
+
+    # Certificate with SANs and custom TTL
+    request-cert -n api.example.com -a "www.example.com,app.example.com" -t 2160h
+
+    # Client certificate
+    request-cert -n client01.internal.local -r client
+
+    # Certificate with IP SANs
+    request-cert -n app.internal.local -i "10.0.1.100,10.0.1.101"
+
+    # Custom output directory
+    request-cert -n db.internal.local -o /etc/ssl/certs
+
+ENVIRONMENT VARIABLES:
+    VAULT_ADDR               Vault server address
+    VAULT_TOKEN              Vault authentication token
+    PKI_PATH                 Vault PKI mount path
+    ROLE                     Default PKI role
+    OUTPUT_DIR               Default output directory
+
+EOF
+    exit 0
+}
+
+check_prerequisites() {
+    log_verbose "Checking prerequisites..."
+    
+    # Check vault CLI
+    if ! command -v vault &> /dev/null; then
+        log_error "vault CLI not found"
+        exit 1
+    fi
+    
+    # Check jq
+    if ! command -v jq &> /dev/null; then
+        log_error "jq not found (required for JSON processing)"
+        exit 1
+    fi
+    
+    # Check openssl
+    if ! command -v openssl &> /dev/null; then
+        log_error "openssl not found (required for certificate validation)"
+        exit 1
+    fi
+    
+    # Check Vault connection
+    if ! vault status &> /dev/null; then
+        log_error "Cannot connect to Vault at $VAULT_ADDR"
+        exit 1
+    fi
+    
+    # Check authentication
+    if ! vault token lookup &> /dev/null; then
+        log_error "Invalid Vault token or not authenticated"
+        exit 1
+    fi
+    
+    log_verbose "All prerequisites met"
+}
+
+validate_inputs() {
+    log_verbose "Validating inputs..."
+    
+    # Common name is required
+    if [ -z "$COMMON_NAME" ]; then
+        log_error "Common name is required (-n/--common-name)"
+        show_usage
+    fi
+    
+    # Validate common name format
+    if [[ ! "$COMMON_NAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+        log_error "Invalid common name format: $COMMON_NAME"
+        exit 1
+    fi
+    
+    # Check if PKI role exists
+    if ! vault list "${PKI_PATH}/roles" 2>/dev/null | grep -q "^${ROLE}$"; then
+        log_error "Role '$ROLE' not found in $PKI_PATH"
+        log_info "Available roles:"
+        vault list "${PKI_PATH}/roles" 2>/dev/null | tail -n +2 || echo "  (none)"
+        exit 1
+    fi
+    
+    # Validate output directory
+    if [ ! -d "$OUTPUT_DIR" ]; then
+        log_info "Creating output directory: $OUTPUT_DIR"
+        mkdir -p "$OUTPUT_DIR"
+    fi
+    
+    # Check for existing files
+    local cert_file="${OUTPUT_DIR}/${COMMON_NAME}.crt"
+    local key_file="${OUTPUT_DIR}/${COMMON_NAME}.key"
+    
+    if [ -f "$cert_file" ] && [ "$FORCE" != "true" ]; then
+        log_error "Certificate file already exists: $cert_file"
+        log_info "Use --force to overwrite"
+        exit 1
+    fi
+    
+    if [ -f "$key_file" ] && [ "$FORCE" != "true" ]; then
+        log_error "Key file already exists: $key_file"
+        log_info "Use --force to overwrite"
+        exit 1
+    fi
+    
+    log_verbose "Input validation passed"
+}
+
+build_request_payload() {
+    log_verbose "Building certificate request payload..."
+    
+    # Start with basic payload
+    local payload=$(jq -n \
+        --arg cn "$COMMON_NAME" \
+        --arg ttl "$TTL" \
+        '{
+            common_name: $cn,
+            ttl: $ttl
+        }')
+    
+    # Add alt names if provided
+    if [ -n "$ALT_NAMES" ]; then
+        payload=$(echo "$payload" | jq --arg alt "$ALT_NAMES" '. + {alt_names: $alt}')
+        log_verbose "Added alt_names: $ALT_NAMES"
+    fi
+    
+    # Add IP SANs if provided
+    if [ -n "$IP_SANS" ]; then
+        payload=$(echo "$payload" | jq --arg ips "$IP_SANS" '. + {ip_sans: $ips}')
+        log_verbose "Added ip_sans: $IP_SANS"
+    fi
+    
+    # Add URI SANs if provided
+    if [ -n "$URI_SANS" ]; then
+        payload=$(echo "$payload" | jq --arg uris "$URI_SANS" '. + {uri_sans: $uris}')
+        log_verbose "Added uri_sans: $URI_SANS"
+    fi
+    
+    # Exclude CN from SANs if requested
+    if [ "$EXCLUDE_CN_FROM_SANS" = "true" ]; then
+        payload=$(echo "$payload" | jq '. + {exclude_cn_from_sans: true}')
+        log_verbose "Excluding CN from SANs"
+    fi
+    
+    echo "$payload"
+}
+
+request_certificate() {
+    # Redirect all output in this function to stderr except the final echo
+    {
+        log_info "Requesting certificate for $COMMON_NAME from Vault..."
+        
+        local payload=$(build_request_payload)
+        local endpoint="${PKI_PATH}/issue/${ROLE}"
+        
+        log_verbose "Vault endpoint: $endpoint"
+        log_verbose "Request payload: $(echo "$payload" | jq -c .)"
+    } >&2
+    
+    # Request certificate from Vault
+    local response
+    local error_output
+    local exit_code
+    
+    # Capture stderr separately to avoid contaminating JSON output
+    error_output=$(mktemp)
+    response=$(vault write -format=json "$endpoint" - <<< "$payload" 2>"$error_output")
+    exit_code=$?
+    
+    # Check if command failed
+    if [ $exit_code -ne 0 ]; then
+        log_error "Certificate request failed"
+        echo "" >&2
+        echo "Error details:" >&2
+        cat "$error_output" >&2
+        rm -f "$error_output"
+        echo "" >&2
+        log_info "Troubleshooting tips:"
+        echo "  1. Check if PKI is set up: vault secrets list | grep pki" >&2
+        echo "  2. Check if role exists: vault list ${PKI_PATH}/roles" >&2
+        echo "  3. Check role config: vault read ${PKI_PATH}/roles/${ROLE}" >&2
+        echo "  4. Verify domain is allowed in role configuration" >&2
+        exit 1
+    fi
+    
+    # Clean up error output file
+    rm -f "$error_output"
+    
+    # Check if response is valid JSON
+    if ! echo "$response" | jq empty 2>/dev/null; then
+        log_error "Invalid response from Vault"
+        echo "$response" >&2
+        exit 1
+    fi
+    
+    # Check for errors in response
+    if echo "$response" | jq -e '.errors' &>/dev/null; then
+        log_error "Vault returned errors:"
+        echo "$response" | jq -r '.errors[]' >&2
+        exit 1
+    fi
+    
+    log_success "Certificate issued successfully" >&2
+    
+    echo "$response"
+}
+
+save_certificate_bundle() {
+    local response="$1"
+    local cert_file="${OUTPUT_DIR}/${COMMON_NAME}.crt"
+    local key_file="${OUTPUT_DIR}/${COMMON_NAME}.key"
+    local ca_file="${OUTPUT_DIR}/${COMMON_NAME}-ca-chain.crt"
+    local bundle_file="${OUTPUT_DIR}/${COMMON_NAME}-bundle.pem"
+    
+    log_info "Saving certificate files..."
+    
+    # Extract certificate
+    echo "$response" | jq -r '.data.certificate' > "$cert_file"
+    chmod 644 "$cert_file"
+    log_verbose "Saved certificate: $cert_file"
+    
+    # Extract private key
+    echo "$response" | jq -r '.data.private_key' > "$key_file"
+    chmod 600 "$key_file"
+    log_verbose "Saved private key: $key_file (permissions: 600)"
+    
+    # Extract CA chain
+    if echo "$response" | jq -e '.data.ca_chain' &>/dev/null; then
+        echo "$response" | jq -r '.data.ca_chain[]' > "$ca_file"
+        chmod 644 "$ca_file"
+        log_verbose "Saved CA chain: $ca_file"
+    fi
+    
+    # Create bundle if requested
+    if [ "$FORMAT" = "bundle" ] || [ "$FORMAT" = "pem" ]; then
+        {
+            cat "$cert_file"
+            echo ""
+            if [ -f "$ca_file" ]; then
+                cat "$ca_file"
+            fi
+        } > "$bundle_file"
+        chmod 644 "$bundle_file"
+        log_verbose "Created certificate bundle: $bundle_file"
+    fi
+    
+    # Create PEM bundle (cert + key + CA) if requested
+    if [ "$FORMAT" = "pem" ]; then
+        local pem_file="${OUTPUT_DIR}/${COMMON_NAME}.pem"
+        {
+            cat "$cert_file"
+            echo ""
+            cat "$key_file"
+            echo ""
+            if [ -f "$ca_file" ]; then
+                cat "$ca_file"
+            fi
+        } > "$pem_file"
+        chmod 600 "$pem_file"
+        log_verbose "Created PEM bundle: $pem_file (permissions: 600)"
+    fi
+}
+
+verify_certificate() {
+    local cert_file="${OUTPUT_DIR}/${COMMON_NAME}.crt"
+    
+    log_info "Verifying certificate..."
+    
+    # Check if certificate is valid
+    if ! openssl x509 -in "$cert_file" -noout -text &>/dev/null; then
+        log_error "Certificate verification failed"
+        return 1
+    fi
+    
+    log_verbose "Certificate is valid"
+    
+    # Extract certificate information
+    local subject=$(openssl x509 -in "$cert_file" -noout -subject | sed 's/subject=//')
+    local issuer=$(openssl x509 -in "$cert_file" -noout -issuer | sed 's/issuer=//')
+    local not_before=$(openssl x509 -in "$cert_file" -noout -startdate | cut -d= -f2)
+    local not_after=$(openssl x509 -in "$cert_file" -noout -enddate | cut -d= -f2)
+    local serial=$(openssl x509 -in "$cert_file" -noout -serial | cut -d= -f2)
+    
+    # Calculate days until expiry
+    local expiry_epoch=$(date -d "$not_after" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$not_after" +%s 2>/dev/null)
+    local current_epoch=$(date +%s)
+    local days_valid=$(( ($expiry_epoch - $current_epoch) / 86400 ))
+    
+    log_verbose "Subject: $subject"
+    log_verbose "Issuer: $issuer"
+    log_verbose "Serial: $serial"
+    log_verbose "Valid from: $not_before"
+    log_verbose "Valid until: $not_after"
+    log_verbose "Days valid: $days_valid"
+    
+    # Store for summary
+    CERT_EXPIRY="$not_after"
+    CERT_DAYS_VALID="$days_valid"
+    CERT_SERIAL="$serial"
+}
+
+print_summary() {
+    echo ""
+    echo "========================================================================"
+    echo -e "${GREEN}Certificate Successfully Issued${NC}"
+    echo "========================================================================"
+    echo ""
+    echo "Certificate Details:"
+    echo "  Common Name:     $COMMON_NAME"
+    echo "  Role:            $ROLE"
+    echo "  TTL:             $TTL"
+    if [ -n "$ALT_NAMES" ]; then
+        echo "  Alt Names:       $ALT_NAMES"
+    fi
+    if [ -n "$IP_SANS" ]; then
+        echo "  IP SANs:         $IP_SANS"
+    fi
+    echo "  Serial Number:   $CERT_SERIAL"
+    echo "  Expires:         $CERT_EXPIRY"
+    echo "  Days Valid:      $CERT_DAYS_VALID days"
+    echo ""
+    echo "Files Created:"
+    echo "  Certificate:     ${OUTPUT_DIR}/${COMMON_NAME}.crt"
+    echo "  Private Key:     ${OUTPUT_DIR}/${COMMON_NAME}.key (permissions: 600)"
+    echo "  CA Chain:        ${OUTPUT_DIR}/${COMMON_NAME}-ca-chain.crt"
+    
+    if [ "$FORMAT" = "bundle" ] || [ "$FORMAT" = "pem" ]; then
+        echo "  Bundle:          ${OUTPUT_DIR}/${COMMON_NAME}-bundle.pem"
+    fi
+    
+    if [ "$FORMAT" = "pem" ]; then
+        echo "  PEM Bundle:      ${OUTPUT_DIR}/${COMMON_NAME}.pem (cert+key+CA)"
+    fi
+    
+    echo ""
+    echo "Usage Examples:"
+    echo ""
+    echo "  # Nginx configuration"
+    echo "  ssl_certificate      ${OUTPUT_DIR}/${COMMON_NAME}.crt;"
+    echo "  ssl_certificate_key  ${OUTPUT_DIR}/${COMMON_NAME}.key;"
+    echo ""
+    echo "  # Apache configuration"
+    echo "  SSLCertificateFile      ${OUTPUT_DIR}/${COMMON_NAME}.crt"
+    echo "  SSLCertificateKeyFile   ${OUTPUT_DIR}/${COMMON_NAME}.key"
+    echo "  SSLCertificateChainFile ${OUTPUT_DIR}/${COMMON_NAME}-ca-chain.crt"
+    echo ""
+    echo "  # Verify certificate"
+    echo "  openssl x509 -in ${OUTPUT_DIR}/${COMMON_NAME}.crt -text -noout"
+    echo ""
+    echo "  # Test certificate with openssl"
+    echo "  openssl s_server -cert ${OUTPUT_DIR}/${COMMON_NAME}.crt \\"
+    echo "    -key ${OUTPUT_DIR}/${COMMON_NAME}.key -accept 8443"
+    echo ""
+    echo "========================================================================"
+}
+
+# ============================================================================
+# Main Script
+# ============================================================================
+
+main() {
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                ;;
+            -n|--common-name)
+                COMMON_NAME="$2"
+                shift 2
+                ;;
+            -r|--role)
+                ROLE="$2"
+                shift 2
+                ;;
+            -t|--ttl)
+                TTL="$2"
+                shift 2
+                ;;
+            -a|--alt-names)
+                ALT_NAMES="$2"
+                shift 2
+                ;;
+            -i|--ip-sans)
+                IP_SANS="$2"
+                shift 2
+                ;;
+            -u|--uri-sans)
+                URI_SANS="$2"
+                shift 2
+                ;;
+            -o|--output)
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            -p|--pki-path)
+                PKI_PATH="$2"
+                shift 2
+                ;;
+            -f|--format)
+                FORMAT="$2"
+                shift 2
+                ;;
+            --exclude-cn-from-sans)
+                EXCLUDE_CN_FROM_SANS="true"
+                shift
+                ;;
+            --force)
+                FORCE="true"
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE="true"
+                shift
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                show_usage
+                ;;
+        esac
+    done
+    
+    # Run certificate request workflow
+    check_prerequisites
+    validate_inputs
+    
+    local response=$(request_certificate)
+    
+    # Validate response (request_certificate exits in subshell, doesn't terminate main)
+    if [ -z "$response" ]; then
+        log_error "Failed to get certificate response from Vault"
+        exit 1
+    fi
+    
+    save_certificate_bundle "$response"
+    verify_certificate
+    
+    log_success "Certificate request completed successfully"
+    
+    print_summary
+}
+
+# Run main function
+main "$@"
