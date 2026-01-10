@@ -29,4 +29,40 @@ vault-pki-toolkit/
 ├── docs/                   # Documentation
 ├── tests/                  # Test suite
 └── examples/               # Integration examples
-`````
+````
+
+## Prerequisites
++ HashiCorp Vault (1.11+)
++ Bash 4.0+
++ jq (JSON processor)
++ openssl (certificate utilities)
++ Vault token with appropriate permissions or **vault server -dev**
+
+### Installation
+```
+# Clone the repository
+git clone https://github.com/sy-cmd/vault-pki-toolkit.git
+cd vault-pki-toolkit
+
+# Set Vault address and token
+export VAULT_ADDR="http://127.0.0.1:8200"
+export VAULT_TOKEN="your-vault-token"
+or the set them in the file 
+
+# Run setup script (creates PKI infrastructure)
+./bin/setup-vault-pki
+
+````
+
+
+Basic Usage
+
+```
+# Request a certificate
+./bin/request-cert -n app.example.com -t 720h
+
+# Monitor certificate expiration
+./bin/monitor-certs
+
+
+```
