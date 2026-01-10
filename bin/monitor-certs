@@ -1,0 +1,472 @@
+#!/bin/bash
+#
+# monitor-certs
+# Monitor TLS certificate expiration from local filesystem
+#
+# Author: Sydney Fwalanga
+# Repository: https://github.com/sy-cmd/vault-pki-toolkit
+
+# Load utility libraries 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="${SCRIPT_DIR}/../lib"
+
+if [ -f "${LIB_DIR}/cert-utils.sh" ]; then
+    source "${LIB_DIR}/cert-utils.sh"
+fi
+set -euo pipefail
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+# Default thresholds (days)
+CRITICAL_THRESHOLD="${CRITICAL_THRESHOLD:-7}"
+WARNING_THRESHOLD="${WARNING_THRESHOLD:-30}"
+
+# Default options
+SCAN_DIRECTORY="${SCAN_DIRECTORY:-.}"
+RECURSIVE="false"
+OUTPUT_FORMAT="table"
+SORT_BY="days"
+FILTER_STATUS="all"
+QUIET="false"
+VERBOSE="false"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Certificate file extensions
+CERT_EXTENSIONS=("crt" "pem" "cert")
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+log_info() {
+    echo -e "${BLUE}ℹ${NC}  $1" >&2
+}
+
+log_success() {
+    echo -e "${GREEN}✓${NC} $1" >&2
+}
+
+log_warn() {
+    echo -e "${YELLOW}⚠${NC}  $1" >&2
+}
+
+log_error() {
+    echo -e "${RED}✗${NC} $1" >&2
+}
+
+log_verbose() {
+    if [ "$VERBOSE" = "true" ]; then
+        echo -e "${BLUE}→${NC} $1" >&2
+    fi
+}
+
+show_usage() {
+    cat << EOF
+Usage: monitor-certs [OPTIONS] [DIRECTORIES...]
+
+Monitor TLS certificate expiration from local filesystem.
+
+OPTIONS:
+    -d, --directory DIR     Directory to scan (default: current directory)
+    -r, --recursive         Scan directories recursively
+    -f, --format FORMAT     Output format: table, json, csv (default: table)
+    -s, --sort FIELD        Sort by: expiration, name, days (default: days)
+    --filter STATUS         Filter by status: critical, warning, healthy, all (default: all)
+    --critical DAYS         Days threshold for critical (default: 7)
+    --warning DAYS          Days threshold for warning (default: 30)
+    -q, --quiet             Only show certificates with warnings/critical status
+    -v, --verbose           Show additional certificate details
+    -h, --help              Show this help message
+
+EXAMPLES:
+    # Monitor current directory
+    monitor-certs
+
+    # Monitor specific directory recursively
+    monitor-certs -d /etc/ssl/certs -r
+
+    # Show only critical and warning certificates
+    monitor-certs --filter warning -q
+
+    # Output as JSON
+    monitor-certs -f json
+
+    # Custom thresholds
+    monitor-certs --critical 3 --warning 14
+
+EOF
+    exit 0
+}
+
+# ============================================================================
+# Certificate Processing Functions
+# ============================================================================
+
+find_certificates() {
+    local directory="$1"
+    local recursive="$2"
+    local find_cmd="find \"$directory\""
+    
+    if [ "$recursive" = "false" ]; then
+        find_cmd="$find_cmd -maxdepth 1"
+    fi
+    
+    # Build find command for all extensions
+    find_cmd="$find_cmd -type f \\("
+    local first=true
+    for ext in "${CERT_EXTENSIONS[@]}"; do
+        if [ "$first" = "true" ]; then
+            find_cmd="$find_cmd -name \"*.$ext\""
+            first=false
+        else
+            find_cmd="$find_cmd -o -name \"*.$ext\""
+        fi
+    done
+    find_cmd="$find_cmd \\) 2>/dev/null"
+    
+    log_verbose "Finding certificates in $directory (recursive: $recursive)"
+    eval "$find_cmd"
+}
+
+parse_certificate() {
+    local cert_file="$1"
+    
+    # Check if file is a valid certificate
+    if ! openssl x509 -in "$cert_file" -noout 2>/dev/null; then
+        log_verbose "Skipping invalid certificate: $cert_file"
+        return 1
+    fi
+    
+    # Extract certificate details
+    local subject=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/subject=//')
+    local cn=$(echo "$subject" | grep -oP 'CN\s*=\s*\K[^,]+' || echo "N/A")
+    local issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/issuer=//')
+    local not_after=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2)
+    local serial=$(openssl x509 -in "$cert_file" -noout -serial 2>/dev/null | cut -d= -f2)
+    
+    # Get SANs if present
+    local sans=$(openssl x509 -in "$cert_file" -noout -text 2>/dev/null | \
+        grep -A1 "Subject Alternative Name" | tail -n1 | \
+        sed 's/DNS://g' | sed 's/,//g' | xargs || echo "")
+    
+    # Calculate days remaining
+    local expiry_epoch=$(date -d "$not_after" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$not_after" +%s 2>/dev/null)
+    local current_epoch=$(date +%s)
+    local days_remaining=$(( ($expiry_epoch - $current_epoch) / 86400 ))
+    
+    # Determine status
+    local status
+    if [ $days_remaining -lt 0 ]; then
+        status="EXPIRED"
+    elif [ $days_remaining -lt $CRITICAL_THRESHOLD ]; then
+        status="CRITICAL"
+    elif [ $days_remaining -lt $WARNING_THRESHOLD ]; then
+        status="WARNING"
+    else
+        status="HEALTHY"
+    fi
+    
+    # Output as delimited string for processing
+    echo "${cert_file}|${cn}|${sans}|${not_after}|${days_remaining}|${status}|${issuer}|${serial}"
+}
+
+calculate_days_remaining() {
+    local expiration_date="$1"
+    local expiry_epoch=$(date -d "$expiration_date" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$expiration_date" +%s 2>/dev/null)
+    local current_epoch=$(date +%s)
+    echo $(( ($expiry_epoch - $current_epoch) / 86400 ))
+}
+
+# ============================================================================
+# Output Formatting Functions
+# ============================================================================
+
+format_output_table() {
+    local -n certs_ref=$1
+    
+    echo ""
+    echo -e "${BOLD}Certificate Expiration Report${NC}"
+    echo "========================================================================"
+    printf "%-40s %-15s %-12s %s\n" "Common Name" "Days Left" "Status" "File"
+    echo "------------------------------------------------------------------------"
+    
+    local total=0
+    local expired=0
+    local critical=0
+    local warning=0
+    local healthy=0
+    
+    for cert_data in "${certs_ref[@]}"; do
+        IFS='|' read -r file cn sans not_after days status issuer serial <<< "$cert_data"
+        
+        total=$((total + 1))
+        
+        case "$status" in
+            EXPIRED)
+                expired=$((expired + 1))
+                color=$RED
+                ;;
+            CRITICAL)
+                critical=$((critical + 1))
+                color=$RED
+                ;;
+            WARNING)
+                warning=$((warning + 1))
+                color=$YELLOW
+                ;;
+            HEALTHY)
+                healthy=$((healthy + 1))
+                color=$GREEN
+                ;;
+        esac
+        
+        # Truncate CN if too long
+        local display_cn="$cn"
+        if [ ${#cn} -gt 38 ]; then
+            display_cn="${cn:0:35}..."
+        fi
+        
+        # Truncate file path
+        local display_file=$(basename "$file")
+        
+        printf "${color}%-40s %6d days    %-10s  %s${NC}\n" \
+            "$display_cn" "$days" "$status" "$display_file"
+        
+        # Show verbose details
+        if [ "$VERBOSE" = "true" ] && [ -n "$sans" ]; then
+            echo -e "${BLUE}    SANs: $sans${NC}"
+        fi
+    done
+    
+    echo "========================================================================"
+    echo -e "${BOLD}Summary:${NC} Total: $total | ${GREEN}Healthy: $healthy${NC} | ${YELLOW}Warning: $warning${NC} | ${RED}Critical: $critical${NC} | ${RED}Expired: $expired${NC}"
+    echo ""
+}
+
+format_output_json() {
+    local -n certs_ref=$1
+    
+    echo "{"
+    echo "  \"scan_date\": \"$(date -Iseconds)\","
+    echo "  \"thresholds\": {"
+    echo "    \"critical\": $CRITICAL_THRESHOLD,"
+    echo "    \"warning\": $WARNING_THRESHOLD"
+    echo "  },"
+    echo "  \"certificates\": ["
+    
+    local first=true
+    for cert_data in "${certs_ref[@]}"; do
+        IFS='|' read -r file cn sans not_after days status issuer serial <<< "$cert_data"
+        
+        if [ "$first" = "false" ]; then
+            echo ","
+        fi
+        first=false
+        
+        echo "    {"
+        echo "      \"file\": \"$file\","
+        echo "      \"common_name\": \"$cn\","
+        echo "      \"sans\": \"$sans\","
+        echo "      \"expiration_date\": \"$not_after\","
+        echo "      \"days_remaining\": $days,"
+        echo "      \"status\": \"$status\","
+        echo "      \"issuer\": \"$(echo "$issuer" | sed 's/"/\\"/g')\","
+        echo "      \"serial\": \"$serial\""
+        echo -n "    }"
+    done
+    
+    echo ""
+    echo "  ]"
+    echo "}"
+}
+
+format_output_csv() {
+    local -n certs_ref=$1
+    
+    # Header
+    echo "File,Common Name,SANs,Expiration Date,Days Remaining,Status,Issuer,Serial"
+    
+    # Data rows
+    for cert_data in "${certs_ref[@]}"; do
+        IFS='|' read -r file cn sans not_after days status issuer serial <<< "$cert_data"
+        
+        # Escape quotes and commas
+        cn=$(echo "$cn" | sed 's/"/""/g')
+        sans=$(echo "$sans" | sed 's/"/""/g')
+        issuer=$(echo "$issuer" | sed 's/"/""/g')
+        
+        echo "\"$file\",\"$cn\",\"$sans\",\"$not_after\",$days,\"$status\",\"$issuer\",\"$serial\""
+    done
+}
+
+# ============================================================================
+# Main Script
+# ============================================================================
+
+main() {
+    local directories=()
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                ;;
+            -d|--directory)
+                SCAN_DIRECTORY="$2"
+                shift 2
+                ;;
+            -r|--recursive)
+                RECURSIVE="true"
+                shift
+                ;;
+            -f|--format)
+                OUTPUT_FORMAT="$2"
+                shift 2
+                ;;
+            -s|--sort)
+                SORT_BY="$2"
+                shift 2
+                ;;
+            --filter)
+                FILTER_STATUS="$2"
+                shift 2
+                ;;
+            --critical)
+                CRITICAL_THRESHOLD="$2"
+                shift 2
+                ;;
+            --warning)
+                WARNING_THRESHOLD="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                QUIET="true"
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE="true"
+                shift
+                ;;
+            *)
+                # Additional directories
+                directories+=("$1")
+                shift
+                ;;
+        esac
+    done
+    
+    # Use specified directories or default
+    if [ ${#directories[@]} -eq 0 ]; then
+        directories=("$SCAN_DIRECTORY")
+    fi
+    
+    log_info "Scanning for certificates..."
+    log_verbose "Directories: ${directories[*]}"
+    log_verbose "Recursive: $RECURSIVE"
+    log_verbose "Format: $OUTPUT_FORMAT"
+    
+    # Find and process certificates
+    local cert_files=()
+    for dir in "${directories[@]}"; do
+        if [ ! -d "$dir" ]; then
+            log_warn "Directory not found: $dir"
+            continue
+        fi
+        
+        while IFS= read -r cert_file; do
+            [ -n "$cert_file" ] && cert_files+=("$cert_file")
+        done < <(find_certificates "$dir" "$RECURSIVE")
+    done
+    
+    if [ ${#cert_files[@]} -eq 0 ]; then
+        log_warn "No certificate files found"
+        exit 0
+    fi
+    
+    log_verbose "Found ${#cert_files[@]} certificate file(s)"
+    
+    # Process certificates
+    local certs_data=()
+    for cert_file in "${cert_files[@]}"; do
+        if cert_info=$(parse_certificate "$cert_file"); then
+            # Apply filters
+            IFS='|' read -r file cn sans not_after days status issuer serial <<< "$cert_info"
+            
+            # Filter by status
+            case "$FILTER_STATUS" in
+                critical)
+                    [[ "$status" == "EXPIRED" || "$status" == "CRITICAL" ]] || continue
+                    ;;
+                warning)
+                    [[ "$status" == "WARNING" || "$status" == "CRITICAL" || "$status" == "EXPIRED" ]] || continue
+                    ;;
+                healthy)
+                    [[ "$status" == "HEALTHY" ]] || continue
+                    ;;
+            esac
+            
+            # Filter by quiet mode
+            if [ "$QUIET" = "true" ]; then
+                [[ "$status" != "HEALTHY" ]] || continue
+            fi
+            
+            certs_data+=("$cert_info")
+        fi
+    done
+    
+    if [ ${#certs_data[@]} -eq 0 ]; then
+        log_info "No certificates match the filter criteria"
+        exit 0
+    fi
+    
+    # Sort certificates
+    case "$SORT_BY" in
+        days)
+            IFS=$'\n' certs_data=($(sort -t'|' -k5 -n <<< "${certs_data[*]}"))
+            ;;
+        name)
+            IFS=$'\n' certs_data=($(sort -t'|' -k2 <<< "${certs_data[*]}"))
+            ;;
+        expiration)
+            IFS=$'\n' certs_data=($(sort -t'|' -k4 <<< "${certs_data[*]}"))
+            ;;
+    esac
+    
+    # Output results
+    case "$OUTPUT_FORMAT" in
+        table)
+            format_output_table certs_data
+            ;;
+        json)
+            format_output_json certs_data
+            ;;
+        csv)
+            format_output_csv certs_data
+            ;;
+        *)
+            log_error "Unknown output format: $OUTPUT_FORMAT"
+            exit 1
+            ;;
+    esac
+    
+    # Exit with error if there are critical/expired certificates
+    for cert_data in "${certs_data[@]}"; do
+        IFS='|' read -r file cn sans not_after days status issuer serial <<< "$cert_data"
+        if [[ "$status" == "EXPIRED" || "$status" == "CRITICAL" ]]; then
+            exit 1
+        fi
+    done
+}
+
+# Run main function
+main "$@"
