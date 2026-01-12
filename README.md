@@ -62,7 +62,39 @@ Basic Usage
 ./bin/request-cert -n app.example.com -t 720h
 
 # Monitor certificate expiration
-./bin/monitor-certs
+./bin/monitor-certs -d /cert
 
+
+``
+Install as Systemd Service (cert-renewal-daemon)
+``
+# Copy files to system locations
+sudo cp bin/cert-renewal-daemon /usr/local/bin/
+sudo chmod +x /usr/local/bin/cert-renewal-daemon
+
+sudo mkdir -p /etc/vault-pki
+sudo cp config/renewal-daemon.conf /etc/vault-pki/
+
+sudo cp systemd/cert-renewal.service /etc/systemd/system/
+
+# Create necessary directories
+sudo mkdir -p /var/log/vault-pki
+sudo mkdir -p /var/lib/vault-pki
+sudo mkdir -p /var/backups/certs
+
+# Reload systemd
+sudo systemctl daemon-reload
+
+# Start the service
+sudo systemctl start cert-renewal
+
+# Check status
+sudo systemctl status cert-renewal
+
+# View logs
+sudo journalctl -u cert-renewal -f
+
+# Enable on boot
+sudo systemctl enable cert-renewal
 
 ```
