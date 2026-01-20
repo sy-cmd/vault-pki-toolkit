@@ -1,0 +1,51 @@
+[Unit]
+Description=Vault PKI Prometheus Exporter
+Documentation=https://github.com/sy-cmd/vault-pki-toolkit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+
+# Main service command
+ExecStart=/usr/local/bin/vault-pki-exporter \
+    --directory /etc/ssl/certs \
+    --port 9100 \
+    --recursive
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+
+# Environment
+Environment="VAULT_ADDR=http://127.0.0.1:8200"
+EnvironmentFile=-/etc/vault-pki/exporter.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vault-pki-exporter
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/ssl/certs
+ReadWritePaths=/var/lib/vault-pki
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+
+# Resource limits
+CPUQuota=25%
+MemoryMax=128M
+TasksMax=5
+
+[Install]
+WantedBy=multi-user.target

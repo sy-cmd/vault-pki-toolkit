@@ -1,0 +1,486 @@
+#!/bin/bash
+#
+# vault-pki-exporter
+# Prometheus metrics exporter for Vault PKI certificates
+#
+# Author: Sydney Fwalanga
+# Repository: https://github.com/sy-cmd/vault-pki-toolkit
+
+set -euo pipefail
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+# HTTP server settings
+LISTEN_PORT="${LISTEN_PORT:-9100}"
+LISTEN_ADDRESS="${LISTEN_ADDRESS:-0.0.0.0}"
+
+# Certificate monitoring
+CERT_DIRECTORY="${CERT_DIRECTORY:-.}"
+RECURSIVE="${RECURSIVE:-false}"
+
+# Vault settings
+VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
+PKI_PATH="${PKI_PATH:-pki_int}"
+
+# Renewal daemon state file
+STATE_FILE="${STATE_FILE:-/var/lib/vault-pki/renewal-state.json}"
+
+# Update interval
+UPDATE_INTERVAL="${UPDATE_INTERVAL:-60}"
+
+# ============================================================================
+# Metrics Storage
+# ============================================================================
+
+declare -A CERT_METRICS
+declare -A STATUS_COUNTS
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $*" >&2
+}
+
+log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2
+}
+
+# ============================================================================
+# Certificate Discovery and Parsing
+# ============================================================================
+
+find_certificates() {
+    local directory="$1"
+    local recursive="$2"
+    
+    local find_cmd="find \"$directory\" -type f"
+    
+    if [ "$recursive" = "false" ]; then
+        find_cmd="$find_cmd -maxdepth 1"
+    fi
+    
+    find_cmd="$find_cmd \\( -name \"*.crt\" -o -name \"*.pem\" -o -name \"*.cert\" \\) 2>/dev/null"
+    
+    eval "$find_cmd"
+}
+
+get_cert_expiry_days() {
+    local cert_file="$1"
+    
+    if ! openssl x509 -in "$cert_file" -noout 2>/dev/null; then
+        return 1
+    fi
+    
+    local expiry_date=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2)
+    local expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null || \
+        date -j -f "%b %d %H:%M:%S %Y %Z" "$expiry_date" +%s 2>/dev/null)
+    local current_epoch=$(date +%s)
+    local days_remaining=$(( ($expiry_epoch - $current_epoch) / 86400 ))
+    
+    echo "$days_remaining"
+}
+
+get_cert_cn() {
+    local cert_file="$1"
+    
+    openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | \
+        grep -oP 'CN\s*=\s*\K[^,]+' || echo "unknown"
+}
+
+get_cert_status() {
+    local days_remaining="$1"
+    
+    if [ "$days_remaining" -lt 0 ]; then
+        echo "expired"
+    elif [ "$days_remaining" -lt 7 ]; then
+        echo "critical"
+    elif [ "$days_remaining" -lt 30 ]; then
+        echo "warning"
+    else
+        echo "healthy"
+    fi
+}
+
+# ============================================================================
+# Metrics Collection
+# ============================================================================
+
+collect_certificate_metrics() {
+    log_info "Collecting certificate metrics..."
+    
+    # Reset metrics
+    CERT_METRICS=()
+    STATUS_COUNTS=([expired]=0 [critical]=0 [warning]=0 [healthy]=0)
+    
+    local cert_files=()
+    while IFS= read -r cert_file; do
+        [ -n "$cert_file" ] && cert_files+=("$cert_file")
+    done < <(find_certificates "$CERT_DIRECTORY" "$RECURSIVE")
+    
+    for cert_file in "${cert_files[@]}"; do
+        local days_remaining=$(get_cert_expiry_days "$cert_file")
+        
+        if [ -z "$days_remaining" ]; then
+            continue
+        fi
+        
+        local cn=$(get_cert_cn "$cert_file")
+        local status=$(get_cert_status "$days_remaining")
+        
+        # Store metric
+        local key="${cn}|${cert_file}"
+        CERT_METRICS[$key]="${days_remaining}|${status}"
+        
+        # Update status counts
+        STATUS_COUNTS[$status]=$((${STATUS_COUNTS[$status]} + 1))
+    done
+    
+    log_info "Collected metrics for ${#CERT_METRICS[@]} certificate(s)"
+}
+
+get_renewal_stats() {
+    if [ ! -f "$STATE_FILE" ]; then
+        echo "0 0"
+        return
+    fi
+    
+    local success=$(jq '[.[] | select(.status=="success")] | length' "$STATE_FILE" 2>/dev/null || echo "0")
+    local failed=$(jq '[.[] | select(.status=="failed")] | length' "$STATE_FILE" 2>/dev/null || echo "0")
+    
+    echo "$success $failed"
+}
+
+check_vault_health() {
+    if vault status &> /dev/null; then
+        echo "1"
+    else
+        echo "0"
+    fi
+}
+
+get_vault_response_time() {
+    local start=$(date +%s%N)
+    
+    if vault status &> /dev/null; then
+        local end=$(date +%s%N)
+        local duration=$(( ($end - $start) / 1000000 ))  # Convert to milliseconds
+        echo "0.$(printf "%03d" $duration)"
+    else
+        echo "0"
+    fi
+}
+
+# ============================================================================
+# Metrics Formatting (Prometheus Format)
+# ============================================================================
+
+format_prometheus_metrics() {
+    cat << 'EOF'
+# HELP cert_expiry_days_remaining Days until certificate expires
+# TYPE cert_expiry_days_remaining gauge
+EOF
+
+    # Certificate expiry metrics
+    for key in "${!CERT_METRICS[@]}"; do
+        IFS='|' read -r cn file <<< "$key"
+        IFS='|' read -r days status <<< "${CERT_METRICS[$key]}"
+        
+        # Sanitize labels for Prometheus
+        cn_safe=$(echo "$cn" | sed 's/[^a-zA-Z0-9_.-]/_/g')
+        file_safe=$(echo "$file" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')
+        
+        echo "cert_expiry_days_remaining{cn=\"$cn\",file=\"$file_safe\",status=\"$status\"} $days"
+    done
+    
+    echo ""
+    
+    # Certificate status counts
+    cat << 'EOF'
+# HELP cert_status_total Total certificates by status
+# TYPE cert_status_total gauge
+EOF
+    
+    for status in expired critical warning healthy; do
+        echo "cert_status_total{status=\"$status\"} ${STATUS_COUNTS[$status]}"
+    done
+    
+    echo ""
+    
+    # Renewal statistics
+    cat << 'EOF'
+# HELP cert_renewal_success_total Total successful certificate renewals
+# TYPE cert_renewal_success_total counter
+# HELP cert_renewal_failure_total Total failed certificate renewals
+# TYPE cert_renewal_failure_total counter
+EOF
+    
+    local renewal_stats=$(get_renewal_stats)
+    IFS=' ' read -r success_count failure_count <<< "$renewal_stats"
+    
+    echo "cert_renewal_success_total $success_count"
+    echo "cert_renewal_failure_total $failure_count"
+    
+    echo ""
+    
+    # Vault PKI health
+    cat << 'EOF'
+# HELP vault_pki_reachable Vault PKI reachability (1=up, 0=down)
+# TYPE vault_pki_reachable gauge
+# HELP vault_pki_response_time_seconds Vault API response time in seconds
+# TYPE vault_pki_response_time_seconds gauge
+EOF
+    
+    local vault_health=$(check_vault_health)
+    local vault_response_time=$(get_vault_response_time)
+    
+    echo "vault_pki_reachable{vault_addr=\"$VAULT_ADDR\"} $vault_health"
+    echo "vault_pki_response_time_seconds{vault_addr=\"$VAULT_ADDR\"} $vault_response_time"
+    
+    echo ""
+    
+    # Exporter metadata
+    cat << EOF
+# HELP vault_pki_exporter_info Exporter version and build information
+# TYPE vault_pki_exporter_info gauge
+vault_pki_exporter_info{version="1.0.0",cert_directory="$CERT_DIRECTORY"} 1
+
+# HELP vault_pki_exporter_scrape_duration_seconds Time spent collecting metrics
+# TYPE vault_pki_exporter_scrape_duration_seconds gauge
+vault_pki_exporter_scrape_duration_seconds $(date +%s)
+EOF
+}
+
+# ============================================================================
+# HTTP Server (using netcat)
+# ============================================================================
+
+handle_request() {
+    local request
+    read -r request
+    
+    # Log request
+    log_info "Request: $request"
+    
+    # Read headers (and discard)
+    while read -r header; do
+        [ -z "$header" ] && break
+        [[ "$header" =~ ^[[:space:]]*$ ]] && break
+    done
+    
+    # Collect fresh metrics
+    collect_certificate_metrics
+    
+    # Generate metrics
+    local metrics=$(format_prometheus_metrics)
+    
+    # Send HTTP response
+    cat << EOF
+HTTP/1.1 200 OK
+Content-Type: text/plain; version=0.0.4
+Content-Length: ${#metrics}
+Connection: close
+
+$metrics
+EOF
+}
+
+run_http_server() {
+    log_info "Starting Prometheus exporter on ${LISTEN_ADDRESS}:${LISTEN_PORT}"
+    log_info "Metrics endpoint: http://${LISTEN_ADDRESS}:${LISTEN_PORT}/metrics"
+    log_info "Certificate directory: $CERT_DIRECTORY"
+    log_info "Update interval: ${UPDATE_INTERVAL}s"
+    
+    # Check if port is available
+    if nc -z "$LISTEN_ADDRESS" "$LISTEN_PORT" 2>/dev/null; then
+        log_error "Port $LISTEN_PORT is already in use"
+        exit 1
+    fi
+    
+    # Collect initial metrics
+    collect_certificate_metrics
+    
+    # Start HTTP server using netcat
+    while true; do
+        # Listen for connection and handle request
+        handle_request | nc -l -p "$LISTEN_PORT" -q 1 2>/dev/null || true
+        
+        # Small delay to prevent CPU spinning
+        sleep 0.1
+    done
+}
+
+# ============================================================================
+# Alternative: Periodic metrics to file
+# ============================================================================
+
+run_file_exporter() {
+    local output_file="${1:-/var/lib/node_exporter/textfile_collector/vault_pki.prom}"
+    local output_dir=$(dirname "$output_file")
+    
+    log_info "Starting file-based exporter"
+    log_info "Output file: $output_file"
+    log_info "Update interval: ${UPDATE_INTERVAL}s"
+    
+    # Create output directory if needed
+    if [ ! -d "$output_dir" ]; then
+        mkdir -p "$output_dir"
+    fi
+    
+    while true; do
+        collect_certificate_metrics
+        
+        # Write metrics to file atomically
+        local temp_file="${output_file}.$$"
+        format_prometheus_metrics > "$temp_file"
+        mv "$temp_file" "$output_file"
+        
+        log_info "Updated metrics file"
+        
+        sleep "$UPDATE_INTERVAL"
+    done
+}
+
+# ============================================================================
+# Main Function
+# ============================================================================
+
+show_usage() {
+    cat << EOF
+Usage: vault-pki-exporter [OPTIONS]
+
+Prometheus metrics exporter for Vault PKI certificates.
+
+OPTIONS:
+    -d, --directory DIR     Certificate directory to monitor (default: .)
+    -r, --recursive         Scan directories recursively
+    -p, --port PORT         HTTP listen port (default: 9100)
+    -a, --address ADDR      HTTP listen address (default: 0.0.0.0)
+    -i, --interval SECONDS  Metrics update interval (default: 60)
+    -m, --mode MODE         Export mode: http, file (default: http)
+    -o, --output FILE       Output file for file mode
+    -h, --help              Show this help message
+
+EXPORT MODES:
+    http    Run HTTP server exposing /metrics endpoint
+    file    Write metrics to file for node_exporter textfile collector
+
+EXAMPLES:
+    # Start HTTP exporter (default)
+    vault-pki-exporter -d /etc/ssl/certs
+
+    # Custom port
+    vault-pki-exporter -p 9101
+
+    # File-based export for node_exporter
+    vault-pki-exporter -m file -o /var/lib/node_exporter/textfile_collector/vault_pki.prom
+
+    # Monitor directory recursively
+    vault-pki-exporter -d /etc/ssl -r
+
+PROMETHEUS CONFIGURATION:
+    Add to prometheus.yml:
+
+    scrape_configs:
+      - job_name: 'vault-pki'
+        static_configs:
+          - targets: ['localhost:9100']
+        scrape_interval: 60s
+
+ENVIRONMENT VARIABLES:
+    LISTEN_PORT             HTTP server port
+    LISTEN_ADDRESS          HTTP server address
+    CERT_DIRECTORY          Certificate directory to monitor
+    RECURSIVE               Scan recursively (true/false)
+    VAULT_ADDR              Vault server address
+    UPDATE_INTERVAL         Metrics update interval (seconds)
+
+EOF
+    exit 0
+}
+
+main() {
+    local mode="http"
+    local output_file=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                ;;
+            -d|--directory)
+                CERT_DIRECTORY="$2"
+                shift 2
+                ;;
+            -r|--recursive)
+                RECURSIVE="true"
+                shift
+                ;;
+            -p|--port)
+                LISTEN_PORT="$2"
+                shift 2
+                ;;
+            -a|--address)
+                LISTEN_ADDRESS="$2"
+                shift 2
+                ;;
+            -i|--interval)
+                UPDATE_INTERVAL="$2"
+                shift 2
+                ;;
+            -m|--mode)
+                mode="$2"
+                shift 2
+                ;;
+            -o|--output)
+                output_file="$2"
+                shift 2
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                show_usage
+                ;;
+        esac
+    done
+    
+    # Check prerequisites
+    if ! command -v nc &> /dev/null; then
+        log_error "netcat (nc) not found - required for HTTP server"
+        exit 1
+    fi
+    
+    if ! command -v openssl &> /dev/null; then
+        log_error "openssl not found"
+        exit 1
+    fi
+    
+    if [ ! -d "$CERT_DIRECTORY" ]; then
+        log_error "Certificate directory not found: $CERT_DIRECTORY"
+        exit 1
+    fi
+    
+    # Run exporter
+    case "$mode" in
+        http)
+            run_http_server
+            ;;
+        file)
+            if [ -z "$output_file" ]; then
+                log_error "Output file required for file mode (-o/--output)"
+                exit 1
+            fi
+            run_file_exporter "$output_file"
+            ;;
+        *)
+            log_error "Unknown mode: $mode"
+            exit 1
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"

@@ -1,0 +1,120 @@
+# Prometheus alert rules for Vault PKI certificates
+
+groups:
+  - name: certificate_alerts
+    interval: 60s
+    rules:
+      # Certificate expiring within 7 days
+      - alert: CertificateExpiringSoon
+        expr: cert_expiry_days_remaining < 7 and cert_expiry_days_remaining >= 0
+        for: 1h
+        labels:
+          severity: warning
+          component: certificate
+        annotations:
+          summary: "Certificate {{ $labels.cn }} expires in {{ $value }} days"
+          description: "Certificate at {{ $labels.file }} is expiring soon ({{ $value }} days remaining)"
+          action: "Review certificate renewal process"
+
+      # Certificate expiring within 3 days (critical)
+      - alert: CertificateExpiringCritical
+        expr: cert_expiry_days_remaining < 3 and cert_expiry_days_remaining >= 0
+        for: 30m
+        labels:
+          severity: critical
+          component: certificate
+        annotations:
+          summary: "Certificate {{ $labels.cn }} expires in {{ $value }} days (CRITICAL)"
+          description: "Certificate at {{ $labels.file }} will expire very soon"
+          action: "Immediate renewal required"
+
+      # Certificate already expired
+      - alert: CertificateExpired
+        expr: cert_expiry_days_remaining < 0
+        for: 5m
+        labels:
+          severity: critical
+          component: certificate
+        annotations:
+          summary: "Certificate {{ $labels.cn }} has EXPIRED"
+          description: "Certificate at {{ $labels.file }} expired {{ $value | abs }} days ago"
+          action: "Replace expired certificate immediately"
+
+      # High number of expiring certificates
+      - alert: ManyCertificatesExpiring
+        expr: sum(cert_status_total{status=~"warning|critical"}) > 5
+        for: 1h
+        labels:
+          severity: warning
+          component: certificate
+        annotations:
+          summary: "Multiple certificates expiring soon ({{ $value }} certificates)"
+          description: "{{ $value }} certificates are in warning or critical state"
+          action: "Review certificate renewal strategy"
+
+      # Certificate renewal failures
+      - alert: CertificateRenewalFailure
+        expr: increase(cert_renewal_failure_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: renewal
+        annotations:
+          summary: "Certificate renewal failures detected"
+          description: "{{ $value }} certificate renewal(s) failed in the last hour"
+          action: "Check renewal daemon logs and Vault connectivity"
+
+      # Vault PKI unreachable
+      - alert: VaultPKIDown
+        expr: vault_pki_reachable == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: vault
+        annotations:
+          summary: "Vault PKI is unreachable"
+          description: "Cannot connect to Vault PKI at {{ $labels.vault_addr }}"
+          action: "Check Vault service status and network connectivity"
+
+      # Vault PKI slow response
+      - alert: VaultPKISlow
+        expr: vault_pki_response_time_seconds > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: vault
+        annotations:
+          summary: "Vault PKI responding slowly"
+          description: "Vault response time is {{ $value }}s (threshold: 1s)"
+          action: "Investigate Vault performance"
+
+      # Exporter down
+      - alert: VaultPKIExporterDown
+        expr: up{job="vault-pki"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: exporter
+        annotations:
+          summary: "Vault PKI exporter is down"
+          description: "The Prometheus exporter for Vault PKI metrics is not responding"
+          action: "Check vault-pki-exporter service status"
+
+  - name: certificate_capacity
+    interval: 5m
+    rules:
+      # Track certificate inventory
+      - record: cert_total
+        expr: sum(cert_status_total)
+
+      # Percentage of certificates in each status
+      - record: cert_status_percentage
+        expr: (cert_status_total / sum(cert_status_total)) * 100
+
+      # Average days until expiry
+      - record: cert_expiry_days_avg
+        expr: avg(cert_expiry_days_remaining)
+
+      # Minimum days until expiry (most urgent)
+      - record: cert_expiry_days_min
+        expr: min(cert_expiry_days_remaining)

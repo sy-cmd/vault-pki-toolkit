@@ -1,0 +1,42 @@
+# Prometheus configuration for Vault PKI monitoring
+
+global:
+  scrape_interval: 60s
+  evaluation_interval: 60s
+  external_labels:
+    monitor: 'vault-pki-monitor'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - 'localhost:9093'
+
+# Load alert rules
+rule_files:
+  - 'alert-rules.yml'
+
+# Scrape configurations
+scrape_configs:
+  # Vault PKI Exporter
+  - job_name: 'vault-pki'
+    static_configs:
+      - targets: ['localhost:9100']
+        labels:
+          environment: 'production'
+          service: 'vault-pki'
+    
+    scrape_interval: 60s
+    scrape_timeout: 10s
+    
+    metric_relabel_configs:
+      # Add custom labels or drop unwanted metrics
+      - source_labels: [__name__]
+        regex: 'cert_.*'
+        action: keep
+
+  # Optional: Scrape Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
