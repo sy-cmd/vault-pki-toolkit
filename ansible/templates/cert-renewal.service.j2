@@ -1,0 +1,43 @@
+[Unit]
+Description=Certificate Renewal Daemon
+Documentation=https://github.com/sy-cmd/vault-pki-toolkit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+ExecStart={{ install_path }}/cert-renewal-daemon --foreground
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=60
+
+Environment="VAULT_ADDR={{ vault_address }}"
+EnvironmentFile=-{{ config_path }}/vault-credentials
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cert-renewal-daemon
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/ssl/certs /var/log/vault-pki /var/lib/vault-pki /var/backups/certs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+
+CPUQuota=50%
+MemoryMax=256M
+TasksMax=10
+
+[Install]
+WantedBy=multi-user.target

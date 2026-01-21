@@ -1,0 +1,76 @@
+---
+# Setup Vault PKI infrastructure
+# Run this on Vault servers to initialize PKI
+
+- name: Setup Vault PKI Infrastructure
+  hosts: vault_servers
+  become: no  # Vault commands run as current user
+  
+  vars:
+    vault_addr: "{{ vault_address | default('http://127.0.0.1:8200') }}"
+    vault_token: "{{ vault_auth_token }}"
+    pki_root_path: "pki"
+    pki_int_path: "pki_int"
+    allowed_domains: "{{ pki_allowed_domains | default('example.com,internal.local') }}"
+    
+  environment:
+    VAULT_ADDR: "{{ vault_addr }}"
+    VAULT_TOKEN: "{{ vault_token }}"
+  
+  tasks:
+    - name: Check Vault status
+      command: vault status
+      register: vault_status
+      changed_when: false
+      failed_when: false
+    
+    - name: Verify Vault is unsealed
+      assert:
+        that:
+          - "'Sealed' in vault_status.stdout"
+          - "'false' in vault_status.stdout"
+        fail_msg: "Vault is sealed or not accessible"
+        success_msg: "Vault is accessible and unsealed"
+    
+    - name: Check if PKI already exists
+      command: vault secrets list -format=json
+      register: secrets_list
+      changed_when: false
+    
+    - name: Parse existing secrets
+      set_fact:
+        existing_secrets: "{{ secrets_list.stdout | from_json }}"
+    
+    - name: Run setup-vault-pki script
+      command: "{{ install_path | default('/usr/local/bin') }}/setup-vault-pki --domains {{ allowed_domains }}"
+      args:
+        creates: /tmp/vault-pki-setup-complete
+      when: pki_int_path + '/' not in existing_secrets
+      register: pki_setup
+    
+    - name: Mark setup as complete
+      file:
+        path: /tmp/vault-pki-setup-complete
+        state: touch
+      when: pki_setup.changed
+    
+    - name: Display PKI setup results
+      debug:
+        msg:
+          - "=== Vault PKI Setup Complete ==="
+          - "Root CA path: {{ pki_root_path }}"
+          - "Intermediate CA path: {{ pki_int_path }}"
+          - "Allowed domains: {{ allowed_domains }}"
+          - ""
+          - "Test certificate request:"
+          - "  vault write {{ pki_int_path }}/issue/server common_name=test.example.com ttl=24h"
+      when: pki_setup.changed
+    
+    - name: Verify PKI roles exist
+      command: vault list {{ pki_int_path }}/roles
+      register: pki_roles
+      changed_when: false
+    
+    - name: Display available roles
+      debug:
+        msg: "Available PKI roles: {{ pki_roles.stdout_lines[1:] }}"

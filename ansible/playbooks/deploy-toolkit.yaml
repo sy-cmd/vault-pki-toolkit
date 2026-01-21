@@ -1,0 +1,179 @@
+---
+# Main deployment playbook for Vault PKI Toolkit
+# Deploys toolkit components across multiple servers
+
+- name: Deploy Vault PKI Toolkit
+  hosts: all
+  become: yes
+  
+  vars:
+    toolkit_version: "v1.1.0"
+    toolkit_repo: "https://github.com/sy-cmd/vault-pki-toolkit.git"
+    install_path: "/usr/local/bin"
+    config_path: "/etc/vault-pki"
+    log_path: "/var/log/vault-pki"
+    state_path: "/var/lib/vault-pki"
+    backup_path: "/var/backups/certs"
+    
+    # Vault configuration
+    vault_addr: "{{ vault_address | default('http://127.0.0.1:8200') }}"
+    vault_token: "{{ vault_auth_token | default('') }}"
+    pki_path: "pki_int"
+    
+    # Component toggles
+    install_renewal_daemon: "{{ enable_renewal_daemon | default(true) }}"
+    install_prometheus_exporter: "{{ enable_prometheus_exporter | default(true) }}"
+    
+  tasks:
+    - name: Display deployment information
+      debug:
+        msg:
+          - "Deploying Vault PKI Toolkit {{ toolkit_version }}"
+          - "Target host: {{ inventory_hostname }}"
+          - "Vault address: {{ vault_addr }}"
+          - "Install path: {{ install_path }}"
+      
+    - name: Install prerequisites
+      apt:
+        name:
+          - vault
+          - jq
+          - openssl
+          - curl
+          - netcat
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+    
+    - name: Install prerequisites (RedHat family)
+      yum:
+        name:
+          - vault
+          - jq
+          - openssl
+          - curl
+          - nc
+        state: present
+      when: ansible_os_family == "RedHat"
+    
+    - name: Create toolkit directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: 0755
+      loop:
+        - "{{ install_path }}"
+        - "{{ config_path }}"
+        - "{{ log_path }}"
+        - "{{ state_path }}"
+        - "{{ backup_path }}"
+    
+    - name: Clone toolkit repository
+      git:
+        repo: "{{ toolkit_repo }}"
+        dest: "/tmp/vault-pki-toolkit"
+        version: "{{ toolkit_version }}"
+        force: yes
+      delegate_to: localhost
+      become: no
+      run_once: true
+    
+    - name: Deploy toolkit scripts
+      copy:
+        src: "/tmp/vault-pki-toolkit/bin/{{ item }}"
+        dest: "{{ install_path }}/{{ item }}"
+        mode: 0755
+      loop:
+        - setup-vault-pki
+        - request-cert
+        - monitor-certs
+        - cert-renewal-daemon
+        - vault-pki-exporter
+    
+    - name: Deploy library files
+      copy:
+        src: "/tmp/vault-pki-toolkit/lib/"
+        dest: "{{ install_path }}/lib/"
+        mode: 0644
+    
+    - name: Create renewal daemon configuration
+      template:
+        src: renewal-daemon.conf.j2
+        dest: "{{ config_path }}/renewal-daemon.conf"
+        mode: 0600
+      when: install_renewal_daemon
+    
+    - name: Create Vault credentials file
+      template:
+        src: vault-credentials.j2
+        dest: "{{ config_path }}/vault-credentials"
+        mode: 0600
+      when: vault_token != ""
+    
+    - name: Install renewal daemon systemd service
+      template:
+        src: cert-renewal.service.j2
+        dest: /etc/systemd/system/cert-renewal.service
+        mode: 0644
+      when: install_renewal_daemon
+      notify: reload systemd
+    
+    - name: Install Prometheus exporter systemd service
+      template:
+        src: vault-pki-exporter.service.j2
+        dest: /etc/systemd/system/vault-pki-exporter.service
+        mode: 0644
+      when: install_prometheus_exporter
+      notify: reload systemd
+    
+    - name: Enable and start renewal daemon
+      systemd:
+        name: cert-renewal
+        enabled: yes
+        state: started
+      when: install_renewal_daemon and vault_token != ""
+    
+    - name: Enable and start Prometheus exporter
+      systemd:
+        name: vault-pki-exporter
+        enabled: yes
+        state: started
+      when: install_prometheus_exporter
+    
+    - name: Create logrotate configuration
+      copy:
+        content: |
+          {{ log_path }}/*.log {
+              daily
+              rotate 7
+              compress
+              delaycompress
+              missingok
+              notifempty
+              create 0644 root root
+          }
+        dest: /etc/logrotate.d/vault-pki
+        mode: 0644
+    
+    - name: Display deployment summary
+      debug:
+        msg:
+          - "=== Deployment Complete ==="
+          - "Toolkit installed to: {{ install_path }}"
+          - "Configuration: {{ config_path }}"
+          - "Logs: {{ log_path }}"
+          - ""
+          - "Services:"
+          - "  - Renewal daemon: {{ 'enabled' if install_renewal_daemon else 'disabled' }}"
+          - "  - Prometheus exporter: {{ 'enabled' if install_prometheus_exporter else 'disabled' }}"
+          - ""
+          - "Next steps:"
+          - "  1. Configure Vault token in {{ config_path }}/vault-credentials"
+          - "  2. Check service status: systemctl status cert-renewal"
+          - "  3. View logs: journalctl -u cert-renewal -f"
+          - "  4. Test certificate request: {{ install_path }}/request-cert -n test.example.com"
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes

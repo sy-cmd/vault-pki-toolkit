@@ -1,0 +1,68 @@
+---
+# Request certificates for multiple hosts
+# Useful for initial setup or mass renewal
+
+- name: Request Certificates for Hosts
+  hosts: certificate_servers
+  become: yes
+  
+  vars:
+    vault_addr: "{{ vault_address }}"
+    vault_token: "{{ vault_auth_token }}"
+    cert_output_dir: "/etc/ssl/certs"
+    cert_role: "{{ certificate_role | default('server') }}"
+    cert_ttl: "{{ certificate_ttl | default('720h') }}"
+    
+  environment:
+    VAULT_ADDR: "{{ vault_addr }}"
+    VAULT_TOKEN: "{{ vault_token }}"
+  
+  tasks:
+    - name: Ensure certificate directory exists
+      file:
+        path: "{{ cert_output_dir }}"
+        state: directory
+        mode: 0755
+    
+    - name: Generate certificate list
+      set_fact:
+        certificates_to_request:
+          - name: "{{ inventory_hostname }}"
+            cn: "{{ inventory_hostname }}"
+            alt_names: "{{ cert_alt_names | default([]) }}"
+    
+    - name: Request certificate for host
+      command: >
+        {{ install_path | default('/usr/local/bin') }}/request-cert
+        -n "{{ item.cn }}"
+        -o "{{ cert_output_dir }}"
+        -r "{{ cert_role }}"
+        -t "{{ cert_ttl }}"
+        {{ '-a "' + (item.alt_names | join(',')) + '"' if item.alt_names | length > 0 else '' }}
+        --force
+      loop: "{{ certificates_to_request }}"
+      register: cert_requests
+    
+    - name: Verify certificates were created
+      stat:
+        path: "{{ cert_output_dir }}/{{ item.cn }}.crt"
+      loop: "{{ certificates_to_request }}"
+      register: cert_files
+    
+    - name: Display certificate information
+      command: openssl x509 -in "{{ item.stat.path }}" -noout -subject -dates
+      loop: "{{ cert_files.results }}"
+      when: item.stat.exists
+      register: cert_info
+      changed_when: false
+    
+    - name: Summary
+      debug:
+        msg:
+          - "=== Certificate Request Complete ==="
+          - "Host: {{ inventory_hostname }}"
+          - "Certificates requested: {{ certificates_to_request | length }}"
+          - "Output directory: {{ cert_output_dir }}"
+          - ""
+          - "Certificate details:"
+          - "{{ cert_info.results | map(attribute='stdout_lines') | list }}"
