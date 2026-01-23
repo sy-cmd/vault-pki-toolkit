@@ -62,3 +62,21 @@ The Vault PKI Certificate Monitor dashboard provides:
    - Select `vault-pki-dashboard.json`
    - Choose your Prometheus data source
    - Click "Import"
+
+## ⚙️ Configuration ( on Grafana UI)
+
+### Configure Prometheus Data Source
+
+If not already configured:
+
+1. **Add Prometheus Data Source**
+   - Configuration → Data Sources → Add data source
+   - Select "Prometheus"
+   - URL: `http://localhost:9090`
+   - Save & Test
+
+2. **Verify Metrics**
+   - Go to Explore
+   - Select Prometheus data source
+   - Query: `cert_expiry_days_remaining`
+   - Should show certificate metrics
