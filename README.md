@@ -50,7 +50,7 @@ export VAULT_TOKEN="your-vault-token"
 or the set them in the file 
 
 # Run setup script (creates PKI infrastructure)
-./bin/setup-vault-pki
+./bin/setup-vault-pki.sh
 
 ````
 
