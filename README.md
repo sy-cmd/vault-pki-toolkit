@@ -26,9 +26,7 @@ vault-pki-toolkit/
 ├── ansible/                # Ansible automation
 ├── monitoring/             # Prometheus & Grafana
 ├── systemd/                # Service files
-├── docs/                   # Documentation
-├── tests/                  # Test suite
-└── examples/               # Integration examples
+
 ````
 
 ## Prerequisites
